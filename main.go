@@ -2,11 +2,11 @@ package main
 
 import (
 	"fmt"
-	"github.com/VictorLowther/btree"
 	"github.com/gorilla/websocket"
 	"github.com/mattn/go-runewidth"
 	"github.com/nsf/termbox-go"
 	"log"
+	"sort"
 	"strconv"
 	"time"
 )
@@ -22,55 +22,69 @@ var (
 	ARROW_DOWN    = '▼'
 )
 
-func byBestBid(a, b *OrderBookEntry) bool {
-	return a.Price >= b.Price
-}
-
-func byBestAsk(a, b *OrderBookEntry) bool {
-	return a.Price < b.Price
-}
-
 type OrderBookEntry struct {
 	Price  float64
 	Volume float64
 }
 
+type byBestAsk []OrderBookEntry
+
+func (a byBestAsk) Len() int {
+	return len(a)
+}
+
+func (a byBestAsk) Swap(i, j int) {
+	a[i], a[j] = a[j], a[i]
+}
+
+func (a byBestAsk) Less(i, j int) bool {
+	return a[i].Price < a[j].Price
+}
+
+type byBestBid []OrderBookEntry
+
+func (b byBestBid) Len() int {
+	return len(b)
+}
+
+func (b byBestBid) Swap(i, j int) {
+	b[i], b[j] = b[j], b[i]
+}
+
+func (b byBestBid) Less(i, j int) bool {
+	return b[i].Price > b[j].Price
+}
+
 type OrderBook struct {
-	Asks *btree.Tree[*OrderBookEntry]
-	Bids *btree.Tree[*OrderBookEntry]
+	Asks map[float64]float64
+	Bids map[float64]float64
 }
 
 func NewOrderBook() *OrderBook {
 	return &OrderBook{
-		Asks: btree.New(byBestAsk),
-		Bids: btree.New(byBestBid),
+		Asks: make(map[float64]float64),
+		Bids: make(map[float64]float64),
 	}
 }
 
-func getBidByPrice(price float64) btree.CompareAgainst[*OrderBookEntry] {
-	return func(e *OrderBookEntry) int {
-		switch {
-		case e.Price > price:
-			return -1
-		case e.Price < price:
-			return 1
-		default:
-			return 0
-		}
+func (ob *OrderBook) addAsk(price, volume float64) {
+	if volume == 0 {
+		delete(ob.Asks, price)
+		return
 	}
+
+	ob.Asks[price] = volume
 }
 
-func getAskByPrice(price float64) btree.CompareAgainst[*OrderBookEntry] {
-	return func(e *OrderBookEntry) int {
-		switch {
-		case e.Price < price:
-			return -1
-		case e.Price > price:
-			return 1
-		default:
-			return 0
+func (ob *OrderBook) addBid(price, volume float64) {
+	if _, ok := ob.Bids[price]; ok {
+		if volume == 0 {
+			delete(ob.Bids, price)
+			return
 		}
 	}
+
+	ob.Bids[price] = volume
 }
 
 func (ob *OrderBook) handleDepthResponse(asks, bids []any) {
@@ -78,85 +92,69 @@ func (ob *OrderBook) handleDepthResponse(asks, bids []any) {
 		ask := v.([]any)
 		price, _ := strconv.ParseFloat(ask[0].(string), 64)
 		volume, _ := strconv.ParseFloat(ask[1].(string), 64)
-		if entry, ok := ob.Asks.Get(getAskByPrice(price)); ok {
-			if volume == 0 {
-				ob.Asks.Delete(entry)
-			} else {
-				entry.Volume = volume
-			}
-			continue
-		}
 
-		entry := &OrderBookEntry{
-			Price:  price,
-			Volume: volume,
-		}
-
-		ob.Asks.Insert(entry)
+		ob.addAsk(price, volume)
 	}
 
 	for _, v := range bids {
 		bid := v.([]any)
 		price, _ := strconv.ParseFloat(bid[0].(string), 64)
 		volume, _ := strconv.ParseFloat(bid[1].(string), 64)
-		if entry, ok := ob.Bids.Get(getBidByPrice(price)); ok {
-			if volume == 0 {
-				ob.Bids.Delete(entry)
-			} else {
-				entry.Volume = volume
-			}
-			continue
-		}
 
-		entry := &OrderBookEntry{
+		ob.addBid(price, volume)
+	}
+}
+
+func (ob *OrderBook) getAsks() []OrderBookEntry {
+	var (
+		depth   = 10
+		entries = make(byBestAsk, len(ob.Asks))
+		i       = 0
+	)
+
+	for price, volume := range ob.Asks {
+		entries[i] = OrderBookEntry{
 			Price:  price,
 			Volume: volume,
 		}
 
-		ob.Bids.Insert(entry)
-	}
-}
-
-func (ob *OrderBook) getBids() []*OrderBookEntry {
-	var (
-		depth = 10
-		bids  = make([]*OrderBookEntry, depth)
-		it    = ob.Bids.Iterator(nil, nil)
-		i     = 0
-	)
-	for it.Next() {
-		if i == depth {
-			break
-		}
-
-		bids[i] = it.Item()
 		i++
 	}
 
-	it.Release()
+	sort.Sort(entries)
+	if len(entries) >= depth {
+		return entries[:depth]
+	}
 
-	return bids
+	return entries
 }
 
-func (ob *OrderBook) getAsks() []*OrderBookEntry {
+func (ob *OrderBook) getBids() []OrderBookEntry {
 	var (
-		depth = 10
-		asks  = make([]*OrderBookEntry, depth)
-		it    = ob.Asks.Iterator(nil, nil)
-		i     = 0
+		depth   = 10
+		entries = make(byBestBid, len(ob.Bids))
+		i       = 0
 	)
-	for it.Next() {
-		if i == depth {
-			break
+
+	for price, volume := range ob.Bids {
+		entries[i] = OrderBookEntry{
+			Price:  price,
+			Volume: volume,
 		}
 
-		asks[i] = it.Item()
 		i++
 	}
 
-	it.Release()
+	sort.Sort(entries)
+	var wants byBestAsk
+	if len(entries) >= depth {
+		wants = byBestAsk(entries[:depth])
+	} else {
+		wants = byBestAsk(entries)
+	}
+	sort.Sort(wants)
 
-	return asks
+	return wants
 }
 
 func (ob *OrderBook) render(x, y int) {
@@ -166,23 +164,15 @@ func (ob *OrderBook) render(x, y int) {
 	}
 
 	for i, ask := range ob.getAsks() {
-		if ask == nil {
-			continue
-		}
-
 		price := fmt.Sprintf("%.2f", ask.Price)
-		volume := fmt.Sprintf("%.2f", ask.Volume)
+		volume := fmt.Sprintf("%.3f", ask.Volume)
 		renderText(x, y+i, price, termbox.ColorRed)
 		renderText(x+10, y+i, volume, termbox.ColorCyan)
 	}
 
 	for i, bid := range ob.getBids() {
-		if bid == nil {
-			continue
-		}
-
 		price := fmt.Sprintf("%.2f", bid.Price)
-		volume := fmt.Sprintf("%.2f", bid.Volume)
+		volume := fmt.Sprintf("%.3f", bid.Volume)
 		renderText(x, 10+i, price, termbox.ColorGreen)
 		renderText(x+10, 10+i, volume, termbox.ColorCyan)
 	}
@@ -234,6 +224,7 @@ func main() {
 				bids := data["b"].([]any)
 				ob.handleDepthResponse(asks, bids)
 			}
+
 			if stream == "btcusdt@markPrice@1s" {
 				prevMarkPrice = curMarkPrice
 				data := result["data"].(map[string]any)
@@ -278,7 +269,7 @@ func renderMarketPrice() {
 	}
 
 	renderText(2, 1, fmt.Sprintf("%.2f", curMarkPrice), color)
-	renderText(9, 1, string(arrow), color)
+	renderText(10, 1, string(arrow), color)
 }
 
 func render() {
@@ -293,18 +284,12 @@ func render() {
 		termbox.SetCell(WIDTH-1, i, '|', termbox.ColorWhite, termbox.ColorDefault)
 	}
 
+	// render the misc border
 	for i := 0; i < WIDTH; i++ {
 		termbox.SetCell(i, 2, '-', termbox.ColorWhite, termbox.ColorDefault)
 	}
 
-	// render the misc border
 	renderMarketPrice()
-}
-
-func renderLine(s, e int, y int, color termbox.Attribute) {
-	for i := s; i < e; i++ {
-		termbox.SetCell(i, y, '-', color, termbox.ColorDefault)
-	}
 }
 
 func renderText(x int, y int, msg string, color termbox.Attribute) {
