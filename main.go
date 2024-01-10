@@ -2,18 +2,15 @@ package main
 
 import (
 	"fmt"
-	ui "github.com/gizak/termui/v3"
-	"github.com/gizak/termui/v3/widgets"
-	"github.com/gorilla/websocket"
 	"log"
 	"sort"
 	"strconv"
 	"time"
-)
 
-// TODO: refactor
-// TODO: fix ws connection bug
-// TODO: add indicators to the ui
+	ui "github.com/gizak/termui/v3"
+	"github.com/gizak/termui/v3/widgets"
+	"github.com/gorilla/websocket"
+)
 
 const wsURL = "wss://fstream.binance.com/stream?streams=btcusdt@markPrice@1s/btcusdt@depth"
 
@@ -25,6 +22,7 @@ var (
 	fundingRate   = "n/a"
 	ARROW_UP      = "▲"
 	ARROW_DOWN    = "▼"
+	rsiWindow     = 14
 )
 
 type OrderBookEntry struct {
@@ -250,6 +248,11 @@ func main() {
 	oBook.RowSeparator = false
 	oBook.TextAlignment = ui.AlignCenter
 
+	pRSI := widgets.NewParagraph()
+	pRSI.Title = "Signal"
+	pRSI.SetRect(30+margin, pHeight+margin, 30+margin+10, 3+pHeight+margin)
+	rsi, _ := NewRSI(make([]float64, rsiWindow+1))
+
 	for isRunning {
 		var (
 			asks = ob.getAsks()
@@ -276,9 +279,13 @@ func main() {
 
 		oBook.Rows = out
 
+		curRSI := rsi.Calculate(curMarkPrice)
+		signal := getRSISignal(curRSI)
+		pRSI.Text = fmt.Sprintf("%s", signal)
+
 		pPrice.Text = getMarketPrice()
 		pFund.Text = fmt.Sprintf("[%s%%](fg:yellow)", fundingRate)
-		ui.Render(pTicker, pPrice, pFund, oBook)
+		ui.Render(pTicker, pPrice, pFund, oBook, pRSI)
 		time.Sleep(time.Millisecond * 20)
 	}
 }
@@ -290,4 +297,75 @@ func getMarketPrice() string {
 	}
 
 	return price
+}
+
+type RSI struct {
+	periods         float64
+	periodsMinusOne float64
+	prev            float64
+	prevAvgGain     float64
+	prevAvgLoss     float64
+}
+
+func NewRSI(initial []float64) (r *RSI, result float64) {
+	if len(initial) < 2 {
+		return nil, 0
+	}
+	periods := len(initial) - 1
+
+	r = &RSI{
+		periods:         float64(periods),
+		periodsMinusOne: float64(periods - 1),
+		prev:            initial[periods],
+	}
+
+	var prev float64
+	for i := 0; i < len(initial); i++ {
+		if i != 0 {
+			diff := initial[i] - prev
+			if diff > 0 {
+				r.prevAvgGain += diff
+			} else {
+				r.prevAvgLoss -= diff
+			}
+		}
+		prev = initial[i]
+	}
+	r.prevAvgGain /= r.periods
+	r.prevAvgLoss /= r.periods
+
+	result = 100 - (100 / (1 + r.prevAvgGain/r.prevAvgLoss))
+
+	return r, result
+}
+
+func (r *RSI) Calculate(next float64) (result float64) {
+	gain := float64(0)
+	loss := float64(0)
+	if diff := next - r.prev; diff > 0 {
+		gain = diff
+	} else {
+		loss = -diff
+	}
+
+	r.prev = next
+
+	r.prevAvgGain = (r.prevAvgGain*r.periodsMinusOne + gain) / r.periods
+	r.prevAvgLoss = (r.prevAvgLoss*r.periodsMinusOne + loss) / r.periods
+
+	result = 100 - 100/(1+r.prevAvgGain/r.prevAvgLoss)
+
+	return result
+}
+
+func getRSISignal(value float64) string {
+	if value > 70 {
+		return "[sell](fg:red)"
+	}
+
+	if value < 30 {
+		return "[buy](fg:green)"
+	}
+
+	return "[hold](fg:yellow)"
 }
